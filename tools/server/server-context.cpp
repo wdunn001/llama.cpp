@@ -3533,6 +3533,19 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             // server-http.cpp wrap the chunked provider with a streaming
             // deflate. br/zstd negotiation can land in a follow-on PR
             // alongside the relevant compile-time guards.
+            //
+            // NOTE for the future zstd patch: per Codec spec/PROTOCOL.md
+            // "Pre-trained ZSTD dictionaries", a server MUST NOT respond
+            // with Content-Encoding: zstd unless it has loaded a
+            // matching pre-trained dict for the request's stream_format
+            // (msgpack vs protobuf are not interchangeable). And per
+            // "Codec-Zstd-Dict response header", every zstd response
+            // MUST carry a `Codec-Zstd-Dict: sha256:<hex>` header naming
+            // the dict in use so the client can pick the right one to
+            // decompress. The Python sglang/vLLM ports compute the hash
+            // once on dict registration and stash it on the response;
+            // the C++ port should do the same. The dict-gate is the
+            // precondition: without a dict, fall through to gzip.
 #if defined(LLAMA_HAVE_CODEC_GZIP)
             {
                 auto ae_it = req.headers.find("Accept-Encoding");
