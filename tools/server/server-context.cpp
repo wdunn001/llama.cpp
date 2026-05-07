@@ -3524,6 +3524,33 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             res->data = frame_bytes_from_result(first_result.get(), first_is_terminal);
             res->status = 200;
             res->content_type = use_protobuf ? "application/x-protobuf" : "application/x-msgpack";
+
+            // ── Accept-Encoding negotiation (gzip-only for now) ────────
+            // Codec frames are tiny structured payloads so gzip's level-6
+            // default crushes them ~30–40× with no measurable TTFT cost
+            // (see Codec/packages/bench/RESULTS.md §1d). When the client
+            // advertises gzip, set Content-Encoding=gzip and let
+            // server-http.cpp wrap the chunked provider with a streaming
+            // deflate. br/zstd negotiation can land in a follow-on PR
+            // alongside the relevant compile-time guards.
+#if defined(LLAMA_HAVE_CODEC_GZIP)
+            {
+                auto ae_it = req.headers.find("Accept-Encoding");
+                if (ae_it == req.headers.end()) {
+                    ae_it = req.headers.find("accept-encoding");
+                }
+                if (ae_it != req.headers.end()) {
+                    const std::string & ae = ae_it->second;
+                    // Loose token search: an "Accept-Encoding: gzip;q=1.0,
+                    // deflate" header should match. We don't parse q=0
+                    // exclusions because no real client emits one for gzip.
+                    if (ae.find("gzip") != std::string::npos) {
+                        res->headers["Content-Encoding"] = "gzip";
+                        res->headers["Vary"] = "Accept-Encoding";
+                    }
+                }
+            }
+#endif // LLAMA_HAVE_CODEC_GZIP
             res->next = [res_this = res.get(), encode_frame_bytes,
                          frame_bytes_from_result, &req](std::string & output) -> bool {
                 try {

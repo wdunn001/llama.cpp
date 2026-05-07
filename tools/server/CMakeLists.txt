@@ -59,6 +59,36 @@ if (NOT LLAMA_CODEC STREQUAL "OFF")
     endif()
 endif()
 
+# ── Codec response compression (optional) ───────────────────────────────
+#
+# Streaming gzip wrapper for the chunked content provider. Lifts Codec
+# wire reduction from format-only ~17–25× to compressed ~700×+ at 2K
+# tokens (matches sglang's gzip cell on the cross-stack matrix in
+# Codec/packages/bench/RESULTS.md §1f). Pure HTTP-layer change; does
+# nothing for non-Codec endpoints (which never set Content-Encoding).
+#
+#   AUTO (default)  enable gzip when zlib is available; silently disable
+#                   otherwise (server still ships, codec runs identity)
+#   ON              fail configure if zlib is missing
+#   OFF             never compress, even if zlib is around
+set(LLAMA_CODEC_GZIP AUTO CACHE STRING "Codec response gzip compression: AUTO|ON|OFF")
+set_property(CACHE LLAMA_CODEC_GZIP PROPERTY STRINGS AUTO ON OFF)
+
+set(LLAMA_HAVE_CODEC_GZIP 0)
+if (NOT LLAMA_CODEC_GZIP STREQUAL "OFF")
+    if (LLAMA_CODEC_GZIP STREQUAL "ON")
+        find_package(ZLIB REQUIRED)
+    else()
+        find_package(ZLIB QUIET)
+    endif()
+    if (ZLIB_FOUND)
+        set(LLAMA_HAVE_CODEC_GZIP 1)
+        message(STATUS "Codec: streaming gzip enabled (zlib ${ZLIB_VERSION_STRING})")
+    else()
+        message(STATUS "Codec: zlib not found — streaming gzip disabled (Codec frames remain wire-only)")
+    endif()
+endif()
+
 # server-context containing the core server logic, used by llama-server and CLI
 
 set(TARGET server-context)
@@ -135,5 +165,10 @@ install(TARGETS ${TARGET} RUNTIME)
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PRIVATE server-context PUBLIC llama-common cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
+
+if (LLAMA_HAVE_CODEC_GZIP)
+    target_compile_definitions(${TARGET} PRIVATE LLAMA_HAVE_CODEC_GZIP=1)
+    target_link_libraries(${TARGET} PRIVATE ZLIB::ZLIB)
+endif()
 
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
