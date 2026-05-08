@@ -121,6 +121,16 @@ if (LLAMA_CODEC_TARGET)
     target_link_libraries(${TARGET} PRIVATE ${LLAMA_CODEC_TARGET})
 endif()
 
+# server-context.cpp's Accept-Encoding negotiation block lives in this
+# static lib; it needs LLAMA_HAVE_CODEC_GZIP defined too so the
+# Content-Encoding response header can land. The actual deflate runs in
+# server-http.cpp (the llama-server target below) which links zlib. Without
+# this define, the negotiation block is compiled out and the server never
+# advertises Content-Encoding: gzip — making the gzip middleware a no-op.
+if (LLAMA_HAVE_CODEC_GZIP)
+    target_compile_definitions(${TARGET} PRIVATE LLAMA_HAVE_CODEC_GZIP=1)
+endif()
+
 
 # llama-server executable
 
