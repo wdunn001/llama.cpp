@@ -3,6 +3,7 @@
 #include "server-models.h"
 #include "server-cors-proxy.h"
 #include "server-tools.h"
+#include "codec_version.hpp"
 
 #include "arg.h"
 #include "build-info.h"
@@ -172,6 +173,25 @@ int main(int argc, char ** argv) {
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));
+    // Codec v0.4: well-known minimum-version policy document.
+    // 404 when no v0.4 capability is mandatory; 200 with the policy
+    // doc when CODEC_*_REQUIRED is set. See
+    // spec/WELL_KNOWN_DISCOVERY.md § Version policy (v0.4+).
+    ctx_http.get ("/.well-known/codec/version-policy.json", [](const server_http_req &) {
+        auto res = std::make_unique<server_http_res>();
+        std::string body = codec_version::version_policy_document_json();
+        if (body.empty()) {
+            res->status = 404;
+            res->content_type = "text/plain";
+            res->data = "";
+        } else {
+            res->status = 200;
+            res->content_type = "application/json";
+            res->data = body;
+        }
+        return res;
+    });
+
     ctx_http.get ("/props",                    ex_wrapper(routes.get_props));
     ctx_http.post("/props",                    ex_wrapper(routes.post_props));
     ctx_http.get ("/models",                   ex_wrapper(routes.get_models)); // public endpoint (no API key check)

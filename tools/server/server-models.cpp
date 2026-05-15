@@ -1,5 +1,6 @@
 #include "server-common.h"
 #include "server-models.h"
+#include "codec_version.hpp"
 
 #include "build-info.h"
 #include "preset.h"
@@ -1120,6 +1121,22 @@ void server_models_routes::init_routes() {
     };
 
     this->proxy_post = [this](const server_http_req & req) {
+        // Codec v0.4 version-negotiation gate. Default-off; fires only
+        // when CODEC_*_REQUIRED is set and the client speaks below the
+        // floor. See spec/versions/v0.4.md § Version Compatibility Signaling.
+        std::string client_version = codec_version::parse_client_version(req.headers);
+        if (codec_version::needs_upgrade(client_version)) {
+            auto resp = codec_version::build_426(client_version);
+            auto res = std::make_unique<server_http_res>();
+            res->status = 426;
+            res->content_type = "application/json";
+            res->data = resp.body;
+            for (const auto & h : resp.headers) {
+                res->headers[h.first] = h.second;
+            }
+            return res;
+        }
+
         std::string method = "POST";
         json body = json::parse(req.body);
         std::string name = json_value(body, "model", std::string());
