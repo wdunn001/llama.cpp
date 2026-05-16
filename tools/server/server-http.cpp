@@ -15,6 +15,15 @@
 #include <zlib.h>
 #endif
 
+#if defined(LLAMA_HAVE_CODEC_BROTLI)
+#include <brotli/encode.h>
+#endif
+
+#if defined(LLAMA_HAVE_CODEC_ZSTD)
+#include <zstd.h>
+#include "codec_zstd_dict_registry.hpp"
+#endif
+
 //
 // HTTP implementation using cpp-httplib
 //
@@ -495,6 +504,167 @@ private:
 };
 #endif // LLAMA_HAVE_CODEC_GZIP
 
+#if defined(LLAMA_HAVE_CODEC_BROTLI)
+// Streaming brotli wrapper. Quality 4 matches `_compress_brotli` in
+// the sglang/vLLM Python ports (sglang/srt/entrypoints/codec_compression.py)
+// and is the operating-point fix from the v0.4.1 bench: BROTLI_DEFAULT_QUALITY
+// (11) is 10–50× slower for stream workloads with negligible ratio gain on
+// the structured-int Codec payload. Mode GENERIC, lgwin 22 mirror the Python.
+//
+// IMPORTANT: do NOT flush after every chunk. The v0.4.1 Python regression
+// (per-chunk flush bug) showed it inflates small streams (64-token msgpack:
+// 1159 B vs 975 B identity) because each flush emits a complete brotli
+// block + its own header, forfeiting between-chunk dictionary sharing.
+// Mid-stream chunks pass BROTLI_OPERATION_PROCESS; the final chunk gets
+// BROTLI_OPERATION_FINISH which flushes once at stream end.
+class codec_brotli_streamer {
+public:
+    codec_brotli_streamer() : enc_(nullptr), initialized_(false) {
+        enc_ = BrotliEncoderCreateInstance(nullptr, nullptr, nullptr);
+        if (enc_ == nullptr) return;
+        // Order of parameters matches the Python ref.
+        if (!BrotliEncoderSetParameter(enc_, BROTLI_PARAM_QUALITY, 4u))           return;
+        if (!BrotliEncoderSetParameter(enc_, BROTLI_PARAM_MODE,    BROTLI_MODE_GENERIC)) return;
+        if (!BrotliEncoderSetParameter(enc_, BROTLI_PARAM_LGWIN,   22u))          return;
+        initialized_ = true;
+    }
+    ~codec_brotli_streamer() {
+        if (enc_) BrotliEncoderDestroyInstance(enc_);
+    }
+    codec_brotli_streamer(const codec_brotli_streamer &) = delete;
+    codec_brotli_streamer & operator=(const codec_brotli_streamer &) = delete;
+
+    bool ok() const { return initialized_; }
+
+    // Append `chunk` to the brotli stream; encoded output appended to
+    // `out`. `op` is BROTLI_OPERATION_PROCESS for mid-stream chunks and
+    // BROTLI_OPERATION_FINISH on the last call.
+    //
+    // Per the brotli API contract (encode.h §BrotliEncoderCompressStream),
+    // FINISH may need multiple calls before the encoder drains; loop
+    // until `available_in == 0` AND, for FINISH, `BrotliEncoderIsFinished`
+    // is true.
+    bool compress_append(const char * data, size_t len, BrotliEncoderOperation op, std::string & out) {
+        if (!initialized_) return false;
+        const uint8_t * next_in = reinterpret_cast<const uint8_t *>(data);
+        size_t avail_in = len;
+
+        uint8_t buf[16 * 1024];
+        // Drive the encoder until input drained. Each call may emit
+        // 0..N output bytes — we copy whatever it produced into `out`.
+        while (true) {
+            uint8_t * next_out = buf;
+            size_t    avail_out = sizeof(buf);
+            if (!BrotliEncoderCompressStream(enc_, op,
+                                             &avail_in, &next_in,
+                                             &avail_out, &next_out,
+                                             nullptr)) {
+                return false;
+            }
+            size_t produced = sizeof(buf) - avail_out;
+            if (produced > 0) {
+                out.append(reinterpret_cast<const char *>(buf), produced);
+            }
+
+            // FINISH continues until the encoder reports done.
+            if (op == BROTLI_OPERATION_FINISH) {
+                if (BrotliEncoderIsFinished(enc_)) return true;
+                // Need another round to drain residual output.
+                continue;
+            }
+
+            // PROCESS / FLUSH: stop once input is consumed and the
+            // encoder has no more queued output.
+            if (avail_in == 0 && !BrotliEncoderHasMoreOutput(enc_)) return true;
+        }
+    }
+
+private:
+    BrotliEncoderState * enc_;
+    bool                 initialized_;
+};
+#endif // LLAMA_HAVE_CODEC_BROTLI
+
+#if defined(LLAMA_HAVE_CODEC_ZSTD)
+// Streaming zstd wrapper. Construction takes the pre-trained dict
+// bytes; ZSTD_CCtx_loadDictionary copies the dict so the caller's
+// std::string can be released after construction.
+//
+// Per Codec v0.4 spec/PROTOCOL.md §Pre-trained ZSTD dictionaries the
+// dict is the precondition for using zstd at all — the negotiator
+// gates selection on codec_zstd_dict_has(stream_format), so this class
+// is never constructed without a real dict. If loadDictionary fails
+// (corrupt dict file, etc.) we set initialized_=false so the dispatch
+// can strip Content-Encoding and fall through to identity rather than
+// stream a broken zstd frame.
+//
+// Level 3 matches the Python reference and is the operating-point for
+// streaming: higher levels (10+) trade CPU for marginal ratio gains on
+// structured Codec payloads with already-loaded dicts. Per-chunk: send
+// ZSTD_e_continue. End: ZSTD_e_end (loops until 0 returned per the
+// zstd.h §ZSTD_compressStream2 contract).
+class codec_zstd_streamer {
+public:
+    explicit codec_zstd_streamer(const std::string & dict_bytes)
+        : cctx_(nullptr), initialized_(false) {
+        cctx_ = ZSTD_createCStream();
+        if (cctx_ == nullptr) return;
+        // Level 3 matches the Python `_compress_zstd` reference.
+        size_t rc = ZSTD_CCtx_setParameter(cctx_, ZSTD_c_compressionLevel, 3);
+        if (ZSTD_isError(rc)) return;
+        rc = ZSTD_CCtx_loadDictionary(cctx_, dict_bytes.data(), dict_bytes.size());
+        if (ZSTD_isError(rc)) {
+            // Dict bytes were unparseable — leave initialized_=false so
+            // the dispatch falls through to identity.
+            return;
+        }
+        initialized_ = true;
+    }
+    ~codec_zstd_streamer() {
+        if (cctx_) ZSTD_freeCStream(cctx_);
+    }
+    codec_zstd_streamer(const codec_zstd_streamer &) = delete;
+    codec_zstd_streamer & operator=(const codec_zstd_streamer &) = delete;
+
+    bool ok() const { return initialized_; }
+
+    // Append `chunk` to the zstd stream; encoded output appended to
+    // `out`. `end` mode is ZSTD_e_continue for mid-stream chunks and
+    // ZSTD_e_end on the last call.
+    //
+    // Per the zstd API contract (zstd.h §ZSTD_compressStream2),
+    // ZSTD_e_end may need multiple calls before the encoder drains the
+    // current frame; loop until the call returns 0 (frame complete) or
+    // produces no more output and consumes all input (continue case).
+    bool compress_append(const char * data, size_t len, ZSTD_EndDirective end, std::string & out) {
+        if (!initialized_) return false;
+        ZSTD_inBuffer in{data, len, 0};
+        uint8_t buf[16 * 1024];
+        while (true) {
+            ZSTD_outBuffer outb{buf, sizeof(buf), 0};
+            size_t rc = ZSTD_compressStream2(cctx_, &outb, &in, end);
+            if (ZSTD_isError(rc)) return false;
+            if (outb.pos > 0) {
+                out.append(reinterpret_cast<const char *>(buf), outb.pos);
+            }
+            if (end == ZSTD_e_end) {
+                if (rc == 0) return true;        // frame complete
+                // else: more output pending, loop to drain.
+                continue;
+            }
+            // ZSTD_e_continue: stop once input is consumed AND the
+            // encoder didn't fill our buffer (would have wanted more
+            // out-space if there was buffered data).
+            if (in.pos == in.size && outb.pos < outb.size) return true;
+        }
+    }
+
+private:
+    ZSTD_CStream * cctx_;
+    bool           initialized_;
+};
+#endif // LLAMA_HAVE_CODEC_ZSTD
+
 static void process_handler_response(server_http_req_ptr && request, server_http_res_ptr & response, httplib::Response & res) {
     if (response->is_stream()) {
         res.status = response->status;
@@ -504,11 +674,121 @@ static void process_handler_response(server_http_req_ptr && request, server_http
         std::shared_ptr<server_http_req> q_ptr = std::move(request);
         std::shared_ptr<server_http_res> r_ptr = std::move(response);
 
-        // Did the handler negotiate gzip on this response?
+        // Which encoding did the handler negotiate? Codec v0.4 preference
+        // order is zstd > br > gzip > identity (see spec/versions/v0.4.md
+        // §Transport-Compression). Dispatch in the same order; each branch
+        // is independently compiled out if the corresponding encoder lib
+        // wasn't found at configure time.
         const auto enc_it = r_ptr->headers.find("Content-Encoding");
+        const std::string enc_value =
+            (enc_it != r_ptr->headers.end()) ? enc_it->second : std::string();
+
+#if defined(LLAMA_HAVE_CODEC_ZSTD)
+        if (enc_value == "zstd") {
+            // The negotiator has already verified codec_zstd_dict_has(stream_format);
+            // pull the dict bytes for the response's content_type-implied format.
+            // The stream_format → dict mapping is keyed by "msgpack" / "protobuf"
+            // (matches the request's stream_format field). content_type was set by
+            // the Codec handler to application/x-{msgpack,protobuf}, so we recover
+            // the format from the suffix.
+            std::string fmt;
+            if (content_type == "application/x-msgpack")       fmt = "msgpack";
+            else if (content_type == "application/x-protobuf") fmt = "protobuf";
+
+            std::string dict_bytes_copy;
+            if (!fmt.empty() && codec_zstd_dict_has(fmt)) {
+                dict_bytes_copy = codec_zstd_dict_bytes(fmt);
+            }
+
+            auto zs = !dict_bytes_copy.empty()
+                ? std::make_shared<codec_zstd_streamer>(dict_bytes_copy)
+                : std::shared_ptr<codec_zstd_streamer>();
+            if (!zs || !zs->ok()) {
+                // Negotiator promised a dict but the registry now disagrees,
+                // or ZSTD_CCtx_loadDictionary rejected it. Strip the header
+                // (and the dict-naming companion) and stream identity rather
+                // than serving a corrupt zstd response.
+                r_ptr->headers.erase("Content-Encoding");
+                r_ptr->headers.erase("Codec-Zstd-Dict");
+                res.set_header("Content-Encoding", ""); // no-op safety
+                res.set_header("Codec-Zstd-Dict",  "");
+                // Fall through to identity below.
+            } else {
+                const auto zstd_provider = [response = r_ptr, zs](size_t, httplib::DataSink & sink) -> bool {
+                    std::string raw;
+                    bool has_next = response->next(raw);
+                    std::string encoded;
+                    ZSTD_EndDirective end = has_next ? ZSTD_e_continue : ZSTD_e_end;
+                    if (!zs->compress_append(raw.data(), raw.size(), end, encoded)) {
+                        return false;
+                    }
+                    if (!encoded.empty()) {
+                        if (!sink.write(encoded.data(), encoded.size())) {
+                            return false;
+                        }
+                    }
+                    if (!has_next) {
+                        sink.done();
+                        SRV_DBG("%s", "http: zstd stream ended\n");
+                    }
+                    return has_next;
+                };
+                const auto on_complete = [request = q_ptr, response = r_ptr, zs](bool) mutable {
+                    zs.reset();
+                    response.reset();
+                    request.reset();
+                };
+                res.set_chunked_content_provider(content_type, zstd_provider, on_complete);
+                return;
+            }
+        }
+#endif // LLAMA_HAVE_CODEC_ZSTD
+
+#if defined(LLAMA_HAVE_CODEC_BROTLI)
+        if (enc_value == "br") {
+            auto br = std::make_shared<codec_brotli_streamer>();
+            if (!br->ok()) {
+                // BrotliEncoderCreateInstance / setParameter failure — strip the
+                // header and stream identity rather than serving a corrupt response.
+                r_ptr->headers.erase("Content-Encoding");
+                res.set_header("Content-Encoding", "");
+            } else {
+                const auto br_provider = [response = r_ptr, br](size_t, httplib::DataSink & sink) -> bool {
+                    std::string raw;
+                    bool has_next = response->next(raw);
+                    std::string encoded;
+                    // PROCESS per chunk (NO per-chunk flush — see v0.4.1
+                    // regression note on codec_brotli_streamer); FINISH on the
+                    // last call so the brotli stream terminates cleanly.
+                    BrotliEncoderOperation op = has_next ? BROTLI_OPERATION_PROCESS : BROTLI_OPERATION_FINISH;
+                    if (!br->compress_append(raw.data(), raw.size(), op, encoded)) {
+                        return false;
+                    }
+                    if (!encoded.empty()) {
+                        if (!sink.write(encoded.data(), encoded.size())) {
+                            return false;
+                        }
+                    }
+                    if (!has_next) {
+                        sink.done();
+                        SRV_DBG("%s", "http: brotli stream ended\n");
+                    }
+                    return has_next;
+                };
+                const auto on_complete = [request = q_ptr, response = r_ptr, br](bool) mutable {
+                    br.reset();
+                    response.reset();
+                    request.reset();
+                };
+                res.set_chunked_content_provider(content_type, br_provider, on_complete);
+                return;
+            }
+        }
+#endif // LLAMA_HAVE_CODEC_BROTLI
+
         const bool want_gzip =
 #if defined(LLAMA_HAVE_CODEC_GZIP)
-            (enc_it != r_ptr->headers.end() && enc_it->second == "gzip");
+            (enc_value == "gzip");
 #else
             false;
 #endif

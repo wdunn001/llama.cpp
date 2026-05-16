@@ -5,6 +5,13 @@
 #include "server-tools.h"
 #include "codec_version.hpp"
 
+#if defined(LLAMA_HAVE_CODEC_ZSTD)
+// Pre-trained ZSTD dict registry. Loaded once at startup from
+// CODEC_ZSTD_DICT_{MSGPACK,PROTOBUF}_PATH; gates the v0.4 zstd
+// negotiator (spec/versions/v0.4.md §Pre-trained ZSTD dictionaries).
+#include "codec_zstd_dict_registry.hpp"
+#endif
+
 #include "arg.h"
 #include "build-info.h"
 #include "common.h"
@@ -79,6 +86,16 @@ int main(int argc, char ** argv) {
     common_params params;
 
     common_init();
+
+#if defined(LLAMA_HAVE_CODEC_ZSTD)
+    // Read CODEC_ZSTD_DICT_{MSGPACK,PROTOBUF}_PATH and stage the dicts so
+    // the Codec negotiator can advertise `Content-Encoding: zstd` for the
+    // matching stream_format. No-op when neither env var is set — the
+    // negotiator falls through to br / gzip / identity per the v0.4
+    // preference order. See spec/versions/v0.4.md §Pre-trained ZSTD
+    // dictionaries for why dict-presence is the precondition for zstd.
+    codec_zstd_dict_load_from_env();
+#endif
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER)) {
         return 1;

@@ -10,6 +10,13 @@
 #include <codec/codec.h>
 #endif
 
+#if defined(LLAMA_HAVE_CODEC_ZSTD)
+// Per-request dict lookup for the v0.4 zstd negotiator. See
+// spec/versions/v0.4.md §Pre-trained ZSTD dictionaries — the negotiator
+// gates `Content-Encoding: zstd` on `codec_zstd_dict_has(stream_format)`.
+#include "codec_zstd_dict_registry.hpp"
+#endif
+
 #include "build-info.h"
 #include "common.h"
 #include "llama.h"
@@ -3695,28 +3702,22 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             res->status = 200;
             res->content_type = use_protobuf ? "application/x-protobuf" : "application/x-msgpack";
 
-            // ── Accept-Encoding negotiation (gzip-only for now) ────────
-            // Codec frames are tiny structured payloads so gzip's level-6
-            // default crushes them ~30–40× with no measurable TTFT cost
-            // (see Codec/packages/bench/RESULTS.md §1d). When the client
-            // advertises gzip, set Content-Encoding=gzip and let
-            // server-http.cpp wrap the chunked provider with a streaming
-            // deflate. br/zstd negotiation can land in a follow-on PR
-            // alongside the relevant compile-time guards.
+            // ── Accept-Encoding negotiation (zstd > br > gzip > identity)
+            // Per Codec v0.4 spec/versions/v0.4.md §Transport-Compression
+            // the server picks the strongest mutually-supported encoding
+            // in preference order. zstd is gated on a pre-trained dict
+            // being registered for the request's stream_format (§Pre-trained
+            // ZSTD dictionaries: msgpack and protobuf are not
+            // interchangeable). Without a dict we fall through to br/gzip;
+            // with a dict we additionally emit Codec-Zstd-Dict per
+            // §Codec-Zstd-Dict response header so the client can pick the
+            // matching dict to decompress.
             //
-            // NOTE for the future zstd patch: per Codec spec/PROTOCOL.md
-            // "Pre-trained ZSTD dictionaries", a server MUST NOT respond
-            // with Content-Encoding: zstd unless it has loaded a
-            // matching pre-trained dict for the request's stream_format
-            // (msgpack vs protobuf are not interchangeable). And per
-            // "Codec-Zstd-Dict response header", every zstd response
-            // MUST carry a `Codec-Zstd-Dict: sha256:<hex>` header naming
-            // the dict in use so the client can pick the right one to
-            // decompress. The Python sglang/vLLM ports compute the hash
-            // once on dict registration and stash it on the response;
-            // the C++ port should do the same. The dict-gate is the
-            // precondition: without a dict, fall through to gzip.
-#if defined(LLAMA_HAVE_CODEC_GZIP)
+            // The three guards (`#if defined(LLAMA_HAVE_CODEC_*)`) are
+            // independent — a build without one encoder simply skips that
+            // branch in the preference order, mirroring the Python
+            // `_BROTLI_AVAILABLE` / `_ZSTD_AVAILABLE` import guards in
+            // sglang/srt/entrypoints/codec_compression.py.
             {
                 auto ae_it = req.headers.find("Accept-Encoding");
                 if (ae_it == req.headers.end()) {
@@ -3724,16 +3725,52 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 }
                 if (ae_it != req.headers.end()) {
                     const std::string & ae = ae_it->second;
-                    // Loose token search: an "Accept-Encoding: gzip;q=1.0,
-                    // deflate" header should match. We don't parse q=0
-                    // exclusions because no real client emits one for gzip.
-                    if (ae.find("gzip") != std::string::npos) {
-                        res->headers["Content-Encoding"] = "gzip";
-                        res->headers["Vary"] = "Accept-Encoding";
+                    // Loose token search matches the v0.4 negotiator in the
+                    // Python ports — clients send "gzip, br, zstd" or
+                    // similar; we don't parse q-values because no real
+                    // client emits q=0 for these encodings.
+                    const bool wants_zstd = ae.find("zstd") != std::string::npos;
+                    const bool wants_br   = ae.find("br")   != std::string::npos;
+                    const bool wants_gzip = ae.find("gzip") != std::string::npos;
+                    const bool wildcard   = ae.find("*")    != std::string::npos;
+
+                    // Always advertise Vary: Accept-Encoding whenever we
+                    // consult the header — even on identity-fallthrough —
+                    // so caches don't serve a gzip body to an identity-only
+                    // client (or vice versa). Matches the Python ref's
+                    // unconditional Vary header.
+                    res->headers["Vary"] = "Accept-Encoding";
+
+                    bool chose = false;
+#if defined(LLAMA_HAVE_CODEC_ZSTD)
+                    // Per spec §Pre-trained ZSTD dictionaries: MUST NOT
+                    // advertise zstd without a matching dict. The dict
+                    // gate is the precondition, not an optimisation.
+                    if (!chose && (wants_zstd || wildcard) &&
+                        codec_zstd_dict_has(stream_format)) {
+                        res->headers["Content-Encoding"] = "zstd";
+                        // Per spec §Codec-Zstd-Dict response header:
+                        // every zstd response MUST carry this header so
+                        // the client can pick the matching dict.
+                        res->headers["Codec-Zstd-Dict"] = codec_zstd_dict_hash(stream_format);
+                        chose = true;
                     }
+#endif // LLAMA_HAVE_CODEC_ZSTD
+#if defined(LLAMA_HAVE_CODEC_BROTLI)
+                    if (!chose && (wants_br || wildcard)) {
+                        res->headers["Content-Encoding"] = "br";
+                        chose = true;
+                    }
+#endif // LLAMA_HAVE_CODEC_BROTLI
+#if defined(LLAMA_HAVE_CODEC_GZIP)
+                    if (!chose && (wants_gzip || wildcard)) {
+                        res->headers["Content-Encoding"] = "gzip";
+                        chose = true;
+                    }
+#endif // LLAMA_HAVE_CODEC_GZIP
+                    (void) chose;
                 }
             }
-#endif // LLAMA_HAVE_CODEC_GZIP
             res->next = [res_this = res.get(), encode_frame_bytes,
                          frame_bytes_from_result, &req](std::string & output) -> bool {
                 try {
