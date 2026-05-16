@@ -208,6 +208,47 @@ int main(int argc, char ** argv) {
         return res;
     });
 
+    // Codec v0.4: protobuf schema for the binary wire format. Lets clients
+    // generate matching decoders from `curl http://<host>/codec/schema`.
+    // Mirror of sglang's `/codec/schema` (codec_frame.PROTO_SCHEMA). See
+    // spec/versions/v0.4.md §Schema endpoint.
+    ctx_http.get ("/codec/schema", [](const server_http_req &) {
+        auto res = std::make_unique<server_http_res>();
+        res->status = 200;
+        res->content_type = "text/plain";
+        res->data =
+            "syntax = \"proto3\";\n"
+            "\n"
+            "// One output chunk from the server.\n"
+            "message CodecFrame {\n"
+            "  repeated uint32 ids           = 1 [packed = true];\n"
+            "  bool            done          = 2;\n"
+            "  optional string finish_reason = 3;\n"
+            "  // Server-side tool-call detection (opt-in via request.tool_watcher).\n"
+            "  // When the model emits a complete <start>..</end> region in this\n"
+            "  // chunk, the parsed result rides along on the same frame whose `ids`\n"
+            "  // come from immediately after the region. Multiple tool calls in\n"
+            "  // one frame are emitted as a list.\n"
+            "  repeated ToolCall tool_calls  = 4;\n"
+            "}\n"
+            "\n"
+            "message ToolCall {\n"
+            "  optional string name           = 1; // parsed from JSON body when shape matches\n"
+            "  string          arguments_json = 2; // raw JSON body between markers\n"
+            "  optional string id             = 3; // server-generated, e.g. \"tc_<hex>\"\n"
+            "}\n"
+            "\n"
+            "// Input to POST /v1/completions/codec (bidirectional binary endpoint).\n"
+            "message CodecRequest {\n"
+            "  repeated uint32 prompt_ids    = 1 [packed = true];\n"
+            "  uint32          max_tokens    = 2;\n"
+            "  float           temperature   = 3;\n"
+            "  repeated string stop          = 4;\n"
+            "  string          stream_format = 5;\n"
+            "}\n";
+        return res;
+    });
+
     ctx_http.get ("/props",                    ex_wrapper(routes.get_props));
     ctx_http.post("/props",                    ex_wrapper(routes.post_props));
     ctx_http.get ("/models",                   ex_wrapper(routes.get_models)); // public endpoint (no API key check)
