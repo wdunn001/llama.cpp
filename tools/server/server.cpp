@@ -5,6 +5,13 @@
 #include "server-tools.h"
 #include "codec_version.hpp"
 
+#if defined(LLAMA_HAVE_CODEC_ZSTD)
+// Pre-trained ZSTD dict registry. Loaded once at startup from
+// CODEC_ZSTD_DICT_{MSGPACK,PROTOBUF}_PATH; gates the v0.4 zstd
+// negotiator (spec/versions/v0.4.md §Pre-trained ZSTD dictionaries).
+#include "codec_zstd_dict_registry.hpp"
+#endif
+
 #include "arg.h"
 #include "build-info.h"
 #include "common.h"
@@ -79,6 +86,16 @@ int main(int argc, char ** argv) {
     common_params params;
 
     common_init();
+
+#if defined(LLAMA_HAVE_CODEC_ZSTD)
+    // Read CODEC_ZSTD_DICT_{MSGPACK,PROTOBUF}_PATH and stage the dicts so
+    // the Codec negotiator can advertise `Content-Encoding: zstd` for the
+    // matching stream_format. No-op when neither env var is set — the
+    // negotiator falls through to br / gzip / identity per the v0.4
+    // preference order. See spec/versions/v0.4.md §Pre-trained ZSTD
+    // dictionaries for why dict-presence is the precondition for zstd.
+    codec_zstd_dict_load_from_env();
+#endif
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER)) {
         return 1;
@@ -188,6 +205,47 @@ int main(int argc, char ** argv) {
             res->content_type = "application/json";
             res->data = body;
         }
+        return res;
+    });
+
+    // Codec v0.4: protobuf schema for the binary wire format. Lets clients
+    // generate matching decoders from `curl http://<host>/codec/schema`.
+    // Mirror of sglang's `/codec/schema` (codec_frame.PROTO_SCHEMA). See
+    // spec/versions/v0.4.md §Schema endpoint.
+    ctx_http.get ("/codec/schema", [](const server_http_req &) {
+        auto res = std::make_unique<server_http_res>();
+        res->status = 200;
+        res->content_type = "text/plain";
+        res->data =
+            "syntax = \"proto3\";\n"
+            "\n"
+            "// One output chunk from the server.\n"
+            "message CodecFrame {\n"
+            "  repeated uint32 ids           = 1 [packed = true];\n"
+            "  bool            done          = 2;\n"
+            "  optional string finish_reason = 3;\n"
+            "  // Server-side tool-call detection (opt-in via request.tool_watcher).\n"
+            "  // When the model emits a complete <start>..</end> region in this\n"
+            "  // chunk, the parsed result rides along on the same frame whose `ids`\n"
+            "  // come from immediately after the region. Multiple tool calls in\n"
+            "  // one frame are emitted as a list.\n"
+            "  repeated ToolCall tool_calls  = 4;\n"
+            "}\n"
+            "\n"
+            "message ToolCall {\n"
+            "  optional string name           = 1; // parsed from JSON body when shape matches\n"
+            "  string          arguments_json = 2; // raw JSON body between markers\n"
+            "  optional string id             = 3; // server-generated, e.g. \"tc_<hex>\"\n"
+            "}\n"
+            "\n"
+            "// Input to POST /v1/completions/codec (bidirectional binary endpoint).\n"
+            "message CodecRequest {\n"
+            "  repeated uint32 prompt_ids    = 1 [packed = true];\n"
+            "  uint32          max_tokens    = 2;\n"
+            "  float           temperature   = 3;\n"
+            "  repeated string stop          = 4;\n"
+            "  string          stream_format = 5;\n"
+            "}\n";
         return res;
     });
 
