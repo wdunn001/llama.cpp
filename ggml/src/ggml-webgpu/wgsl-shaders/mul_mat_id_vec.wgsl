@@ -52,10 +52,12 @@ fn main(
 #ifdef USE_SUBGROUP_REDUCTION
   , @builtin(subgroup_id) subgroup_id: u32,
     @builtin(subgroup_invocation_id) subgroup_invocation_id: u32,
-    @builtin(num_subgroups) num_subgroups: u32,
     @builtin(subgroup_size) subgroup_size: u32
 #endif
 ) {
+#ifdef USE_SUBGROUP_REDUCTION
+    let num_subgroups = (WG_SIZE + subgroup_size - 1u) / subgroup_size;
+#endif
 
     let thread_id = local_id.x;
 

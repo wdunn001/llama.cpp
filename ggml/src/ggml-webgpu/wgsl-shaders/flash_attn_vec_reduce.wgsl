@@ -31,9 +31,9 @@ const FLOAT_MIN: f32 = -1.0e9;
 @compute @workgroup_size(WG_SIZE)
 fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
         @builtin(subgroup_id) subgroup_id: u32,
-        @builtin(num_subgroups) num_subgroups: u32,
         @builtin(subgroup_size) subgroup_size: u32,
         @builtin(subgroup_invocation_id) sg_inv_id: u32) {
+    let num_subgroups = (WG_SIZE + subgroup_size - 1u) / subgroup_size;
     let rid = wg_id.x;
     if (rid >= params.nrows) {
         return;
