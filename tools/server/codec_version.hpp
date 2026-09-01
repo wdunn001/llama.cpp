@@ -22,6 +22,7 @@
 #ifndef LLAMA_SERVER_CODEC_VERSION_HPP
 #define LLAMA_SERVER_CODEC_VERSION_HPP
 
+#include <cctype>
 #include <cstdlib>
 #include <map>
 #include <sstream>
@@ -94,10 +95,37 @@ inline std::map<std::string, std::string> header_version_introduced() {
     };
 }
 
+// Lower-cased copy of header_version_introduced() for case-insensitive
+// lookup. HTTP field names are case-insensitive per RFC 9110 §5.1.
+// A caller-supplied header differing only in case from the table's
+// canonical spelling must still resolve to the same floor.
+// Mirrors the lowercased registry built once in the Python reference,
+// vllm/entrypoints/codec_version.py.
+inline std::map<std::string, std::string> header_version_introduced_lower() {
+    std::map<std::string, std::string> out;
+    for (const auto & kv : header_version_introduced()) {
+        std::string k = kv.first;
+        for (auto & c : k) c = static_cast<char>(std::tolower(c));
+        out[k] = kv.second;
+    }
+    return out;
+}
+
+// True iff the server may emit `name` to a client speaking
+// `client_version`. A header not in the table defaults to true.
+// That covers both the v0.2 baseline headers and non-Codec headers such
+// as Content-Type or Vary.
+//
+// The lookup is case-insensitive. Without this, a header spelled with a
+// different case than the table's entry would miss the table lookup and
+// fall through to the "always emit" default, leaking a v0.4 header to a
+// client that never asked for it.
 inline bool should_emit_header(const std::string & name, const std::string & client_version) {
-    auto floors = header_version_introduced();
-    auto it = floors.find(name);
-    if (it == floors.end()) return true;  // unknown/non-codec header — pass through
+    std::string lower_name = name;
+    for (auto & c : lower_name) c = static_cast<char>(std::tolower(c));
+    auto floors = header_version_introduced_lower();
+    auto it = floors.find(lower_name);
+    if (it == floors.end()) return true;
     return version_ge(client_version, it->second);
 }
 

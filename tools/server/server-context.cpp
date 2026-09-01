@@ -29,6 +29,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -48,6 +49,98 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+#if defined(LLAMA_HAVE_CODEC)
+// Codec Accept-Encoding negotiation, hardened.
+//
+// The original negotiator ran a bare substring search:
+// `ae.find("gzip") != npos`. A comment beside it asserted that no real
+// client emits q=0 for these encodings. RFC 9110 section 12.5.3 defines
+// q=0 as "not acceptable". A client that sends
+// `Accept-Encoding: gzip;q=0, br` must not receive a gzip response. The
+// substring search cannot see the `;q=0` qualifier at all. The substring
+// search has a second defect. It matches an encoding name inside
+// another token: `gzip` matches inside `x-gzip`.
+//
+// This parser mirrors the fixed reference parsers in
+// sglang/srt/entrypoints/codec_compression.py and
+// vllm/entrypoints/codec_compression.py. All three engines resolve the
+// same edge cases, including the `*` wildcard and `*;q=0`.
+//
+// codec_accept_encoding_q returns the client's effective q-value for
+// `coding`. An explicit entry for `coding` wins over a `*` entry. A
+// coding that is neither listed nor covered by `*` is not acceptable.
+// Per RFC 9110 section 12.5.3, that case returns 0.0.
+inline double codec_accept_encoding_q(const std::string & accept_encoding, const std::string & coding) {
+    double explicit_q = -1.0;
+    double wildcard_q = -1.0;
+
+    size_t start = 0;
+    while (start <= accept_encoding.size()) {
+        size_t comma = accept_encoding.find(',', start);
+        std::string part = accept_encoding.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+        start = (comma == std::string::npos) ? accept_encoding.size() + 1 : comma + 1;
+
+        size_t nb = part.find_first_not_of(" \t");
+        if (nb == std::string::npos) continue;
+        size_t ne = part.find_last_not_of(" \t");
+        part = part.substr(nb, ne - nb + 1);
+
+        size_t semi = part.find(';');
+        std::string name = (semi == std::string::npos) ? part : part.substr(0, semi);
+        size_t name_nb = name.find_first_not_of(" \t");
+        if (name_nb == std::string::npos) continue;
+        size_t name_ne = name.find_last_not_of(" \t");
+        name = name.substr(name_nb, name_ne - name_nb + 1);
+        for (auto & c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+        double q = 1.0;
+        if (semi != std::string::npos) {
+            size_t pstart = semi + 1;
+            while (pstart <= part.size()) {
+                size_t psemi = part.find(';', pstart);
+                std::string param = part.substr(pstart, psemi == std::string::npos ? std::string::npos : psemi - pstart);
+                pstart = (psemi == std::string::npos) ? part.size() + 1 : psemi + 1;
+
+                size_t pb = param.find_first_not_of(" \t");
+                if (pb == std::string::npos) continue;
+                size_t pe = param.find_last_not_of(" \t");
+                param = param.substr(pb, pe - pb + 1);
+
+                std::string lparam = param;
+                for (auto & c : lparam) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (lparam.rfind("q=", 0) == 0) {
+                    try {
+                        q = std::stod(param.substr(2));
+                    } catch (...) {
+                        // A malformed q-value defaults to 1.0. One typo
+                        // must not break negotiation for the rest of the
+                        // header.
+                        q = 1.0;
+                    }
+                }
+            }
+        }
+
+        if (name == coding && explicit_q < 0.0) {
+            explicit_q = q;
+        } else if (name == "*" && wildcard_q < 0.0) {
+            wildcard_q = q;
+        }
+    }
+
+    if (explicit_q >= 0.0) return explicit_q;
+    if (wildcard_q >= 0.0) return wildcard_q;
+    return 0.0;
+}
+
+// codec_accept_encoding_wants is true iff `coding` is acceptable under
+// `accept_encoding`. Acceptable means the effective q-value returned by
+// codec_accept_encoding_q is greater than zero.
+inline bool codec_accept_encoding_wants(const std::string & accept_encoding, const std::string & coding) {
+    return codec_accept_encoding_q(accept_encoding, coding) > 0.0;
+}
+#endif // defined(LLAMA_HAVE_CODEC)
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -4624,14 +4717,16 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 }
                 if (ae_it != req.headers.end()) {
                     const std::string & ae = ae_it->second;
-                    // Loose token search matches the v0.4 negotiator in the
-                    // Python ports — clients send "gzip, br, zstd" or
-                    // similar; we don't parse q-values because no real
-                    // client emits q=0 for these encodings.
-                    const bool wants_zstd = ae.find("zstd") != std::string::npos;
-                    const bool wants_br   = ae.find("br")   != std::string::npos;
-                    const bool wants_gzip = ae.find("gzip") != std::string::npos;
-                    const bool wildcard   = ae.find("*")    != std::string::npos;
+                    // codec_accept_encoding_wants is q-value aware, per
+                    // RFC 9110 section 12.5.3. A coding sent with q=0 is
+                    // not acceptable. A coding excluded from an
+                    // otherwise-accepted `*` wildcard is not acceptable
+                    // either. See the function definition near the top
+                    // of this file for the full parser and the reason
+                    // the previous substring search was wrong.
+                    const bool wants_zstd = codec_accept_encoding_wants(ae, "zstd");
+                    const bool wants_br   = codec_accept_encoding_wants(ae, "br");
+                    const bool wants_gzip = codec_accept_encoding_wants(ae, "gzip");
 
                     // Always advertise Vary: Accept-Encoding, Codec-Client-Version
                     // whenever we consult the Accept-Encoding header — even on
@@ -4648,7 +4743,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     // Per spec §Pre-trained ZSTD dictionaries: MUST NOT
                     // advertise zstd without a matching dict. The dict
                     // gate is the precondition, not an optimisation.
-                    if (!chose && (wants_zstd || wildcard) &&
+                    if (!chose && wants_zstd &&
                         codec_zstd_dict_has(stream_format)) {
                         res->headers["Content-Encoding"] = "zstd";
                         // Per spec §Codec-Zstd-Dict response header:
@@ -4659,13 +4754,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     }
 #endif // LLAMA_HAVE_CODEC_ZSTD
 #if defined(LLAMA_HAVE_CODEC_BROTLI)
-                    if (!chose && (wants_br || wildcard)) {
+                    if (!chose && wants_br) {
                         res->headers["Content-Encoding"] = "br";
                         chose = true;
                     }
 #endif // LLAMA_HAVE_CODEC_BROTLI
 #if defined(LLAMA_HAVE_CODEC_GZIP)
-                    if (!chose && (wants_gzip || wildcard)) {
+                    if (!chose && wants_gzip) {
                         res->headers["Content-Encoding"] = "gzip";
                         chose = true;
                     }
