@@ -154,6 +154,8 @@ extern "C" {
         bool buffer_from_host_ptr;
         // event synchronization
         bool events;
+        // mmap is supported for loading
+        bool mmap_support;
     };
 
     // all the device properties
@@ -381,11 +383,15 @@ extern "C" {
         //   - most tensors have n_segments == 1 and a contiguous slice of the tensor data
         //   - some tensors have an inhomogenenous data layout along the split axis,
         //     those tensors are divided into segments which are each individually split across devices
-        //   - ne has one entry per segment and device that add up to ggml_tensor::ne for that axis,
-        //     the outer/inner loops are over segments/devices like [seg0_dev0, seg0_dev1, seg1_dev0, seg1_dev1],
+        //   - ne has one entry per segment and device and that segment repeats nr times,
+        //     in total when accounting for repetitions the segments add up to ggml_tensor::ne for that axis,
+        //     the outer/inner loops are over segments/devices like [seg0_dev0_r0, seg0_dev1_r0, seg0_dev0_r1, seg0_dev1_r1, seg1_dev0_r0, seg1_dev1_r0],
         //   - for example, a transformer may have a fused QKV matrix rather than 3 matrices, those would be 3 separate segments
-        //     that each need to be split individually across devices so that each device gets a slice of Q, K, and V
+        //     that each need to be split individually across devices so that each device gets a slice of Q, K, and V,
+        //     the Q matrix can be larger than the K and V matrices so this can either be expressed as 3 segments or as 2 segments
+        //     where the segment for K/V repeats twice
         int64_t  ne[16*GGML_BACKEND_META_MAX_DEVICES];
+        uint32_t nr[16];
         uint32_t n_segments;
     };
 
@@ -417,6 +423,10 @@ extern "C" {
 
     // Compare the output of two backends
     GGML_API bool ggml_backend_compare_graph_backend(ggml_backend_t backend1, ggml_backend_t backend2, struct ggml_cgraph * graph, ggml_backend_eval_callback callback, void * user_data, struct ggml_tensor const * const * test_nodes, size_t num_test_nodes);
+
+    // returns true for ops that may require additional memory for fleeting data on some backends,
+    // i.e. the backend's get_alloc_size may return more than ggml_nbytes for the output tensor
+    GGML_API bool ggml_backend_op_alloc_size_may_expand(enum ggml_op op);
 
     // Tensor initialization
     GGML_API enum ggml_status ggml_backend_tensor_alloc(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, void * addr);

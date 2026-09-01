@@ -105,7 +105,7 @@ fn main(
 
 #ifdef USE_SUBGROUP_REDUCTION
     for (var row = 0u; row < OUTPUTS_PER_WG; row++) {
-        let subgroup_total = subgroupAdd(acc[row]);
+        let subgroup_total = subgroupAdd(acc[0][row]);
         if (subgroup_invocation_id == 0u) {
             partial_sums[partial_index(row, subgroup_id)] = subgroup_total;
         }
@@ -128,7 +128,7 @@ fn main(
 
 #ifdef USE_WORKGROUP_REDUCTION
     for (var row = 0u; row < OUTPUTS_PER_WG; row++) {
-        partial_sums[partial_index(row, thread_id)] = acc[row];
+        partial_sums[partial_index(row, thread_id)] = acc[0][row];
     }
 
     workgroupBarrier();

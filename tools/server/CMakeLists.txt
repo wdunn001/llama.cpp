@@ -241,8 +241,14 @@ add_library(${TARGET} STATIC
     server-common.h
     server-context.cpp
     server-context.h
+    server-stream.cpp
+    server-stream.h
     server-tools.cpp
     server-tools.h
+    server-mcp.cpp
+    server-mcp.h
+    server-schema.cpp
+    server-schema.h
     codec_zstd_dict_registry.cpp
     codec_zstd_dict_registry.hpp
 )
@@ -263,15 +269,16 @@ endif()
 # server-context.cpp's Accept-Encoding negotiation block lives in this
 # static lib; it needs LLAMA_HAVE_CODEC_GZIP defined too so the
 # Content-Encoding response header can land. The actual deflate runs in
-# server-http.cpp (the llama-server target below) which links zlib. Without
-# this define, the negotiation block is compiled out and the server never
-# advertises Content-Encoding: gzip — making the gzip middleware a no-op.
+# server-http.cpp (part of the llama-server-impl library below) which
+# links zlib. Without this define, the negotiation block is compiled out
+# and the server never advertises Content-Encoding: gzip — making the
+# gzip middleware a no-op.
 if (LLAMA_HAVE_CODEC_GZIP)
     target_compile_definitions(${TARGET} PRIVATE LLAMA_HAVE_CODEC_GZIP=1)
 endif()
 # Same propagation rule for brotli + zstd. The negotiator gates each
 # encoding behind its respective LLAMA_HAVE_CODEC_* define; the actual
-# encoders link into server-http.cpp below.
+# encoders link into server-http.cpp, part of llama-server-impl below.
 if (LLAMA_HAVE_CODEC_BROTLI)
     target_compile_definitions(${TARGET} PRIVATE LLAMA_HAVE_CODEC_BROTLI=1)
 endif()
@@ -279,26 +286,28 @@ if (LLAMA_HAVE_CODEC_ZSTD)
     target_compile_definitions(${TARGET} PRIVATE LLAMA_HAVE_CODEC_ZSTD=1)
 endif()
 
+# llama-server-impl: server logic, reusable by app
 
-# llama-server executable
+set(TARGET llama-server-impl)
 
-set(TARGET llama-server)
-
-set(TARGET_SRCS
+add_library(${TARGET}
     server.cpp
     server-http.cpp
     server-http.h
     server-models.cpp
     server-models.h
 )
+set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
-add_executable(${TARGET} ${TARGET_SRCS})
-install(TARGETS ${TARGET} RUNTIME)
+target_include_directories(${TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(${TARGET} PRIVATE ../mtmd ${CMAKE_SOURCE_DIR})
+target_link_libraries(${TARGET} PUBLIC server-context llama-ui cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
 
-target_include_directories(${TARGET} PRIVATE ../mtmd)
-target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(${TARGET} PRIVATE server-context llama-ui PUBLIC llama-common cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
-
+# server.cpp / server-http.cpp / server-models.cpp are compiled into this
+# library now (upstream split them out of the llama-server executable),
+# and server-http.cpp is where the Codec streaming wrapper actually calls
+# the gzip/brotli/zstd encoders (see codec_version.hpp and the Codec
+# compression negotiation in server-context.cpp for the define gate).
 if (LLAMA_HAVE_CODEC_GZIP)
     target_compile_definitions(${TARGET} PRIVATE LLAMA_HAVE_CODEC_GZIP=1)
     target_link_libraries(${TARGET} PRIVATE ZLIB::ZLIB)
@@ -313,11 +322,23 @@ if (LLAMA_HAVE_CODEC_BROTLI)
 endif()
 
 # Zstd encoder link + define. The streaming wrapper loads a pre-trained
-# dict per request from the codec_zstd_dict_registry (linked above into
-# server-context).
+# dict per request from the codec_zstd_dict_registry (linked into
+# server-context above).
 if (LLAMA_HAVE_CODEC_ZSTD)
     target_compile_definitions(${TARGET} PRIVATE LLAMA_HAVE_CODEC_ZSTD=1)
     target_link_libraries(${TARGET} PRIVATE ${LLAMA_CODEC_ZSTD_TARGET})
 endif()
 
+if(LLAMA_TOOLS_INSTALL)
+    install(TARGETS ${TARGET} LIBRARY)
+endif()
+
+# llama-server executable
+
+set(TARGET llama-server)
+
+add_executable(${TARGET} main.cpp)
+install(TARGETS ${TARGET} RUNTIME)
+
+target_link_libraries(${TARGET} PRIVATE llama-server-impl)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
